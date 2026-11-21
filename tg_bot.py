@@ -13,7 +13,13 @@ import asyncio
 import json
 import os
 import random
+import re
 import sqlite3
+import time
+
+import httpx
+
+import tester
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandStart
@@ -45,6 +51,7 @@ class St(StatesGroup):
     phone = State()
     code = State()
     password = State()
+    joinlist = State()
 
 
 def read_state():
@@ -81,15 +88,22 @@ ABOUT = (HEADER + "<b>درباره</b>\n"
 
 def main_kb():
     st = read_state()
-    mode = "فقط تست‌شده‌ها ✅️" if st.get("send_mode") == "passed_only" else "همه 📤"
+    mode = "فقط تست‌شده‌ها ✅️" if st.get("send_mode") == "passed_only" else "فایل‌ها حتی بدون تست 📁"
     win = WINDOWS.get(st.get("time_window", "now"), "از الان")
     files = "روشن ✅️" if st.get("files_enabled", True) else "خاموش ❌️"
+    def sep(label):
+        return [InlineKeyboardButton(text=label, callback_data="noop")]
     rows = [
+        sep("── 🌉 پل ──"),
         [InlineKeyboardButton(text="📲 ورود به اکانت تلگرام", callback_data="login")],
         [InlineKeyboardButton(text="📊 وضعیت پل", callback_data="status"),
          InlineKeyboardButton(text="📋 کانال‌های عضو", callback_data="channels")],
+        sep("── 📥 منابع ──"),
         [InlineKeyboardButton(text="⭐️ عضویت در بهترین کانال‌ها", callback_data="joinbest"),
+         InlineKeyboardButton(text="📥 جوین با لیست", callback_data="joinlist")],
+        [InlineKeyboardButton(text="📚 منابع ثبت‌شده", callback_data="sources"),
          InlineKeyboardButton(text="🔎 اسکن سابقه کانال‌ها", callback_data="backfill")],
+        sep("── ⚙️ تنظیمات ──"),
         [InlineKeyboardButton(text=f"🎯 حالت ارسال: {mode}", callback_data="mode")],
         [InlineKeyboardButton(text=f"🕐 بازه زمانی: {win}", callback_data="winmenu"),
          InlineKeyboardButton(text=f"📁 فایل‌ها: {files}", callback_data="files")],
@@ -122,10 +136,21 @@ def bridge_client() -> TelegramClient:
 @router.message(CommandStart())
 async def cmd_start(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id):
+        await m.answer(PUBLIC_WELCOME)
         return
     await state.clear()
     await m.answer(HEADER + "کانفیگ‌های همه کانال‌های عضوشده، با تست واقعی، می‌رن تو کانال بله.",
                    reply_markup=main_kb())
+
+
+PUBLIC_WELCOME = (
+    "🌉 <b>Moki Bridge | پل موکی</b>\n━━━━━━━━━━━━━━━\n"
+    "🧪 <b>تست کانفیگ</b>\n"
+    "کانفیگ‌هات رو بفرست — لینک (هر خط یکی)، لینک ساب، یا فایل "
+    "NPV / NPVT / OVPN / WireGuard — دونه‌دونه با تست واقعی چک می‌کنم و "
+    "می‌گم کدوم وصله، کدوم نامعلومه، کدوم قطعه؛ با خروجی و وضعیت از ایران.\n\n"
+    "📢 کانفیگ‌های تست‌شده روزانه: کانال بله moki1sc@\n"
+    "🆘 پشتیبانی: @illiioiilli")
 
 
 @router.callback_query(F.data == "home")
@@ -419,6 +444,237 @@ async def cb_joinbest(c: CallbackQuery):
         return
     write_state(want_join=True)
     await c.answer("⭐️ عضویت شروع شد — گزارشش تو لاگ‌ها میاد", show_alert=True)
+
+
+@router.callback_query(F.data == "noop")
+async def cb_noop(c: CallbackQuery):
+    await c.answer()
+
+
+# ---------------- join-by-list + sources (owner) ----------------
+
+@router.callback_query(F.data == "joinlist")
+async def cb_joinlist(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await state.set_state(St.joinlist)
+    await c.message.answer(
+        HEADER + "📥 <b>جوین با لیست</b>\n"
+        "یوزرنیم یا لینک کانال‌ها رو بفرست — هر خط یکی، یا همه رو با فاصله.\n"
+        "مثال:\n<code>@channel1\nt.me/channel2</code>")
+    await c.answer()
+
+
+@router.message(St.joinlist)
+async def got_joinlist(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return
+    names = []
+    for tok in re.split(r"[\s,]+", m.text or ""):
+        tok = tok.strip().lstrip("@")
+        if tok.startswith("t.me/"):
+            tok = tok[5:]
+        tok = tok.split("/")[0].split("?")[0]
+        if re.fullmatch(r"[A-Za-z0-9_]{4,}", tok or ""):
+            names.append(tok)
+    await state.clear()
+    if not names:
+        await m.answer(HEADER + "چیزی پیدا نشد — یوزرنیم‌ها رو دوباره بفرست.",
+                       reply_markup=main_kb())
+        return
+    st = read_state()
+    cur = st.get("want_join_list") or []
+    write_state(want_join_list=cur + names)
+    await m.answer(HEADER + f"📥 {len(names)} کانال به صف جوین اضافه شد.\n"
+                   "پل دونه‌دونه عضوشون می‌شه و اطلاعات کاملشون تو «📚 منابع» ثبت می‌شه.",
+                   reply_markup=main_kb())
+
+
+@router.callback_query(F.data == "sources")
+async def cb_sources(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    db = sqlite3.connect(DB_PATH)
+    try:
+        rows = db.execute(
+            "SELECT username,title,members FROM sources ORDER BY members DESC"
+        ).fetchall()
+    except Exception:
+        rows = []
+    db.close()
+    if not rows:
+        await c.message.edit_text(HEADER + "📚 هنوز منبعی ثبت نشده — بعد از اولین اسکن/جوین اینجا میان.",
+                                  reply_markup=main_kb())
+        return await c.answer()
+    lines = []
+    for un, title, members in rows[:30]:
+        mem = f" — {members:,} عضو" if members else ""
+        lines.append(f"• {title} <code>@{un}</code>{mem}")
+    await c.message.edit_text(
+        HEADER + f"📚 <b>منابع ثبت‌شده ({len(rows)})</b>\n" + "\n".join(lines),
+        reply_markup=main_kb())
+    await c.answer()
+
+
+# ---------------- public config tester ----------------
+
+LINK_RE = re.compile(
+    r"(?:vless|vmess|trojan|ss|ssr|hysteria2?|hy2|tuic|wireguard|snell)"
+    r"://[^\s<>'\"\)\]]+", re.IGNORECASE)
+URL_RE = re.compile(r"https?://[^\s<>'\"\)\]]+")
+_test_sem = asyncio.Semaphore(3)
+_cooldown = {}
+MAX_BATCH = 10
+USER_TEST_EXTS = {".npv", ".npvt", ".ovpn", ".conf", ".txt"}
+
+
+def _extract_links(text):
+    out = []
+    for m_ in LINK_RE.findall(text or ""):
+        link = m_.rstrip(".,;")
+        if link.lower().startswith("hy2://"):
+            link = "hysteria2://" + link[6:]
+        out.append(link)
+    return out
+
+
+async def _expand_subs(text):
+    """http(s) links in the text may be subscription URLs: fetch, decode
+    (plain or base64), and pull the config links out of them."""
+    links = _extract_links(text)
+    for url in URL_RE.findall(text or ""):
+        if len(links) >= MAX_BATCH:
+            break
+        try:
+            async with httpx.AsyncClient(timeout=12) as cl:
+                r = await cl.get(url, follow_redirects=True)
+            body = r.text
+            if "://" not in body:
+                import base64
+                try:
+                    body = base64.b64decode(body.strip()).decode("utf-8", "ignore")
+                except Exception:
+                    body = ""
+            links += _extract_links(body)
+        except Exception:
+            continue
+    seen, uniq = set(), []
+    for l in links:
+        if l not in seen:
+            seen.add(l)
+            uniq.append(l)
+    return uniq[:MAX_BATCH]
+
+
+def _summary_line(i, res):
+    if res.get("ok"):
+        loc = f"{tester.flag(res.get('exit_country_code', ''))} {res.get('exit_country', '')}".strip()
+        ping = res.get("ping_ms")
+        iran = {True: " · 🇮🇷 ✅️", False: " · 🇮🇷 ⚠️"}.get(res.get("iran_reach"), "")
+        return (f"{i}) ✅️ <b>وصل</b> — {loc} · 📶 {ping if ping is not None else '—'}ms{iran}")
+    if res.get("partial"):
+        return (f"{i}) ⚠️ <b>نامعلوم</b> — {res.get('probes_ok', '؟')} از "
+                f"{res.get('probes_total', 4)} دامنه جواب دادن")
+    return f"{i}) ❌️ <b>قطع</b> — {tester.user_reason(res)}"
+
+
+async def _run_user_tests(m: Message, links):
+    probe = read_state().get("probe_url", tester.DEFAULT_PROBE)
+    results = []
+
+    async def one(link):
+        async with _test_sem:
+            try:
+                return await tester.test_link(link, probe_url=probe)
+            except Exception as e:
+                return {"ok": False, "error": f"tester_crash: {e}"[:60]}
+
+    results = await asyncio.gather(*[one(l) for l in links])
+    if len(links) == 1:
+        res = results[0]
+        if res.get("ok"):
+            body = tester.format_result(res)
+        elif res.get("partial"):
+            body = tester.format_partial(res)
+        else:
+            body = f"❌️ وصل نشد — {tester.user_reason(res)}"
+        await m.answer("🧪 <b>نتیجه تست</b>\n" + body)
+        return
+    lines = [_summary_line(i + 1, r) for i, r in enumerate(results)]
+    ok_n = sum(1 for r in results if r.get("ok"))
+    await m.answer(f"🧪 <b>نتیجه تست {len(results)} کانفیگ — {ok_n} تا وصل ✅️</b>\n"
+                   + "\n".join(lines))
+
+
+def _cooling(uid):
+    now = time.time()
+    last = _cooldown.get(uid, 0)
+    if now - last < 60:
+        return int(60 - (now - last))
+    _cooldown[uid] = now
+    return 0
+
+
+@router.message(F.text)
+async def public_text(m: Message, state: FSMContext):
+    if await state.get_state() is not None:
+        return  # an owner FSM flow (login / join-list) owns this message
+    text = m.text or ""
+    if not (LINK_RE.search(text) or URL_RE.search(text)):
+        if not is_admin(m.from_user.id):
+            await m.answer("🧪 کانفیگ یا لینک ساب رو بفرست تا تست کنم.\n"
+                           "لینک کانفیگ، یا فایل NPV / OVPN / WireGuard.")
+        return
+    wait = _cooling(m.from_user.id)
+    if wait:
+        await m.answer(f"⏳ یه کم صبر کن — {wait} ثانیه دیگه دوباره بفرست.")
+        return
+    await m.answer("⏳ در حال تست…")
+    links = await _expand_subs(text)
+    if not links:
+        await m.answer("❌️ تو این متن لینک کانفیگ خوانایی پیدا نشد.")
+        return
+    await _run_user_tests(m, links)
+
+
+@router.message(F.document)
+async def public_file(m: Message):
+    doc = m.document
+    name = doc.file_name or "file"
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in USER_TEST_EXTS and not is_admin(m.from_user.id):
+        await m.answer("🧪 این فرمت رو تست نمی‌کنم — NPV / NPVT / OVPN / conf وایرگارد بفرست.")
+        return
+    if doc.file_size and doc.file_size > 5 * 1024 * 1024:
+        await m.answer("❌️ فایل خیلی بزرگه (سقف ۵ مگ).")
+        return
+    wait = _cooling(m.from_user.id)
+    if wait:
+        await m.answer(f"⏳ یه کم صبر کن — {wait} ثانیه دیگه دوباره بفرست.")
+        return
+    await m.answer("⏳ در حال تست فایل…")
+    try:
+        fobj = await m.bot.get_file(doc.file_id)
+        buf = await m.bot.download_file(fobj.file_path)
+        data = buf.read()
+    except Exception:
+        await m.answer("❌️ دانلود فایل از تلگرام نشد — دوباره بفرست.")
+        return
+    probe = read_state().get("probe_url", tester.DEFAULT_PROBE)
+    async with _test_sem:
+        try:
+            res = await tester.test_file(data, name, probe_url=probe)
+        except Exception as e:
+            res = {"ok": False, "error": f"tester_crash: {e}"[:60]}
+    if res.get("ok"):
+        body = tester.format_result(res)
+    elif res.get("partial"):
+        body = tester.format_partial(res)
+    elif res.get("error"):
+        body = f"❌️ وصل نشد — {tester.user_reason(res)}"
+    else:
+        body = "🧪 این فایل قابل تست خودکار نیست (فرمت قفل‌شده) — تو چنل بله بدون خطا فوروارد می‌شه."
+    await m.answer("🧪 <b>نتیجه تست فایل</b>\n" + body)
 
 
 async def main():

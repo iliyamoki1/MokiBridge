@@ -62,7 +62,7 @@ def dbq(sql, args=()):
 
 def panel_kb():
     st = read_state()
-    mode = "فقط تست‌شده‌ها ✅️" if st.get("send_mode") == "passed_only" else "همه 📤"
+    mode = "فقط تست‌شده‌ها ✅️" if st.get("send_mode") == "passed_only" else "فایل‌ها حتی بدون تست 📁"
     win = {"now": "از الان", "1h": "۱ ساعت اخیر", "24h": "۲۴ ساعت اخیر",
            "all": "همه"}.get(st.get("time_window", "now"), "از الان")
     files = "روشن ✅️" if st.get("files_enabled", True) else "خاموش ❌️"
@@ -77,6 +77,8 @@ def panel_kb():
         [{"text": "🧪 دامنه تست اتصال", "callback_data": "probemenu"}],
         [{"text": "⭐️ عضویت در بهترین کانال‌ها", "callback_data": "join"},
          {"text": "🔎 اسکن سابقه", "callback_data": "backfill"}],
+        [{"text": "📥 جوین با لیست", "callback_data": "joinlist"},
+         {"text": "📚 منابع", "callback_data": "sources"}],
         [{"text": "ℹ️ درباره", "callback_data": "about"}],
     ]
     return {"inline_keyboard": rows}
@@ -128,6 +130,22 @@ async def edit_panel(client, chat_id, msg_id, text):
 
 
 _custom_probe_wait = set()
+_joinlist_wait = set()
+
+
+def sources_text():
+    try:
+        rows = dbq("SELECT username,title,members FROM sources "
+                   "ORDER BY members DESC")
+    except Exception:
+        rows = []
+    if not rows:
+        return HEADER + "📚 هنوز منبعی ثبت نشده — بعد از اولین اسکن/جوین اینجا میان."
+    lines = []
+    for un, title, members in rows[:30]:
+        mem = f" — {members:,} عضو" if members else ""
+        lines.append(f"• {title} (@{un}){mem}")
+    return HEADER + f"📚 منابع ثبت‌شده ({len(rows)})\n" + "\n".join(lines)
 
 
 async def handle_message(client, msg):
@@ -136,6 +154,27 @@ async def handle_message(client, msg):
         return
     chat_id = msg["chat"]["id"]
     text = (msg.get("text") or "").strip()
+    if chat_id in _joinlist_wait and text:
+        _joinlist_wait.discard(chat_id)
+        import re as _re
+        names = []
+        for tok in _re.split(r"[\s,]+", text):
+            tok = tok.strip().lstrip("@")
+            if tok.startswith("t.me/"):
+                tok = tok[5:]
+            tok = tok.split("/")[0].split("?")[0]
+            if _re.fullmatch(r"[A-Za-z0-9_]{4,}", tok or ""):
+                names.append(tok)
+        if names:
+            st = read_state()
+            write_state(want_join_list=(st.get("want_join_list") or []) + names)
+            await api(client, "sendMessage", chat_id=chat_id,
+                      text=f"📥 {len(names)} کانال به صف جوین اضافه شد — اطلاعات کاملشون تو «📚 منابع» ثبت می‌شه.")
+        else:
+            await api(client, "sendMessage", chat_id=chat_id,
+                      text="چیزی پیدا نشد — یوزرنیم‌ها رو دوباره بفرست.")
+        await send_panel(client, chat_id)
+        return
     if chat_id in _custom_probe_wait and text.startswith("http"):
         _custom_probe_wait.discard(chat_id)
         write_state(probe_url=text)
@@ -173,7 +212,7 @@ async def handle_callback(client, cb):
     elif data == "mode":
         new = "all" if st.get("send_mode") == "passed_only" else "passed_only"
         write_state(send_mode=new)
-        label = "فقط کانفیگ‌های تست‌شده ✅️" if new == "passed_only" else "همه کانفیگ‌ها 📤"
+        label = "فقط کانفیگ‌های تست‌شده ✅️" if new == "passed_only" else "فایل‌ها حتی بدون تست هم میان 📁"
         await edit_panel(client, chat_id, msg_id, HEADER + f"🎯 حالت ارسال: {label}")
     elif data == "files":
         write_state(files_enabled=not st.get("files_enabled", True))
@@ -211,6 +250,12 @@ async def handle_callback(client, cb):
         write_state(want_join=True)
         await api(client, "sendMessage", chat_id=chat_id,
                   text="⭐️ عضویت در بهترین کانال‌ها شروع شد — گزارشش تو لاگ‌ها میاد")
+    elif data == "joinlist":
+        _joinlist_wait.add(chat_id)
+        await api(client, "sendMessage", chat_id=chat_id,
+                  text="📥 یوزرنیم یا لینک کانال‌ها رو بفرست — هر خط یکی، یا با فاصله.\nمثال:\n@channel1\nt.me/channel2")
+    elif data == "sources":
+        await edit_panel(client, chat_id, msg_id, sources_text())
     elif data == "backfill":
         write_state(want_backfill=True)
         await api(client, "sendMessage", chat_id=chat_id,

@@ -306,6 +306,51 @@ def _dns_a(host: str, resolver: str, timeout=3.0):
         return set()
 
 
+_iran_reach_cache = {}
+
+
+async def iran_reach(host: str):
+    """Iran-vantage reachability (Iliya's order: tests must speak for
+    IRAN, not just Germany). A Globalping probe inside Tehran pings the
+    config's server. Returns (reachable True/False/None, avg_ms|None);
+    None = no Iran probe answered in time — stated honestly, never
+    guessed. Cached 10 min per host."""
+    if not host:
+        return None, None
+    now = time.time()
+    hit = _iran_reach_cache.get(host)
+    if hit and now - hit[0] < 600:
+        return hit[1], hit[2]
+    out = (None, None)
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.post("https://api.globalping.io/v1/measurements",
+                             json={"type": "ping", "target": host,
+                                   "locations": [{"country": "IR",
+                                                  "city": "Tehran"}],
+                                   "limit": 1})
+            mid = r.json().get("id")
+            if mid:
+                for _ in range(10):
+                    await asyncio.sleep(2)
+                    g = await c.get(
+                        f"https://api.globalping.io/v1/measurements/{mid}")
+                    d = g.json()
+                    if d.get("status") == "finished":
+                        res0 = (d.get("results") or [{}])[0]
+                        stats = ((res0.get("result") or {})
+                                 .get("stats") or {})
+                        rcv = stats.get("rcv")
+                        if rcv is not None:
+                            out = (rcv > 0,
+                                   stats.get("avg") if rcv > 0 else None)
+                        break
+    except Exception:
+        out = (None, None)
+    _iran_reach_cache[host] = (now, out[0], out[1])
+    return out
+
+
 def iran_dns_status(host: str) -> str:
     """Legacy sync check (kept for compat; iran_dns_check is primary)."""
     try:
@@ -457,7 +502,10 @@ async def test_link(link: str, timeout: int = 22, probe_url: str = DEFAULT_PROBE
         proc = await asyncio.create_subprocess_exec(
             *cmd, cfg_path, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT)
-        return await _wait_and_probe(proc, sport, probe_url, res)
+        reach_task = asyncio.create_task(iran_reach(host))
+        out = await _wait_and_probe(proc, sport, probe_url, res)
+        out["iran_reach"], out["iran_ping_ms"] = await reach_task
+        return out
     finally:
         if proc and proc.returncode is None:
             try:
@@ -496,44 +544,42 @@ async def _wait_and_probe(proc, sport, probe_url, res):
         res["error"] = ("core_exit: " + (tail[-1][:110] if tail else "?")) \
             if proc.returncode is not None else "core_not_up"
         return res
-    body, code, ms = await loop.run_in_executor(
-        None, _curl_socks, sport, probe_url, 10)
-    if code not in (200, 204):
-        res["error"] = f"tunnel_http_{code or 'timeout'}"
+    # MULTI-DOMAIN VERDICT (Iliya's law): the tunnel is probed against
+    # several different domains. ALL answer -> «وصل» (connected). SOME
+    # answer -> «نامعلوم» (unknown). NONE answer -> «قطع» (disconnected).
+    probe_urls = list(dict.fromkeys([
+        probe_url,
+        "http://cp.cloudflare.com/generate_204",
+        "http://www.google.com/generate_204",
+        "http://connectivitycheck.gstatic.com/generate_204",
+        "https://cp.cloudflare.com/generate_204",
+    ]))[:4]
+    results = await asyncio.gather(*[
+        loop.run_in_executor(None, _curl_socks, sport, u, 10)
+        for u in probe_urls])
+    oks = [c in (200, 204) for _b, c, _m in results]
+    probes_ok = sum(oks)
+    res["probes_ok"] = probes_ok
+    res["probes_total"] = len(probe_urls)
+    res["tunnel_ms"] = next((m for _b, c, m in results if c in (200, 204)), None)
+    if probes_ok == 0:
+        res["error"] = "tunnel_http_timeout"
         return res
-    res["tunnel_ms"] = ms
-    # STRICT VERIFICATION (Iliya's order: tests must be precise — one lucky
-    # probe is not "connected"). A config only passes if, through the same
-    # tunnel, a SECOND probe also succeeds AND real data actually flows
-    # (a 25 KB download), not just a handshake.
-    body2, code2, _ms2 = await loop.run_in_executor(
-        None, _curl_socks, sport, probe_url, 10)
-    if code2 not in (200, 204):
-        res["error"] = "tunnel_unstable"
-        return res
+    # real-data layer: an actual 25 KB download through the same tunnel
     dl, code3, dl_ms = await loop.run_in_executor(
         None, _curl_socks, sport,
         "http://speed.cloudflare.com/__down?bytes=25000", 12)
-    if code3 != 200 or not dl or len(dl) < 10000:
-        res["error"] = "tunnel_nodata"
-        return res
-    res["dl_ms"] = dl_ms
-    if dl_ms:
-        res["speed_kbps"] = round(len(dl) / max(dl_ms, 1) * 1000 / 1024, 1)
-    # Layer: HTTPS through the tunnel (some configs pass plain HTTP but
-    # break TLS). Two targets; the layer fails only if both fail.
-    https_ok = False
-    for url in ("https://www.google.com/generate_204",
-                "https://cp.cloudflare.com/generate_204"):
-        _b, code4, _m = await loop.run_in_executor(
-            None, _curl_socks, sport, url, 10)
-        if code4 in (200, 204):
-            https_ok = True
-            break
-    res["https_ok"] = https_ok
-    if not https_ok:
-        res["error"] = "tunnel_https_fail"
-        return res
+    data_ok = code3 == 200 and bool(dl) and len(dl) >= 10000
+    if data_ok:
+        res["dl_ms"] = dl_ms
+        if dl_ms:
+            res["speed_kbps"] = round(len(dl) / max(dl_ms, 1) * 1000 / 1024, 1)
+    if probes_ok < len(probe_urls) or not data_ok:
+        res["partial"] = True
+        res["error"] = "verdict_unknown"
+        # still collect exit info below for the «نامعلوم» post
+    else:
+        res["https_ok"] = True
     body, code, _ms = await loop.run_in_executor(
         None, _curl_socks, sport,
         "http://ip-api.com/json/?fields=query,country,countryCode,isp", 10)
@@ -546,7 +592,9 @@ async def _wait_and_probe(proc, sport, probe_url, res):
             res["exit_isp"] = d.get("isp", "")
         except Exception:
             pass
-    res["ok"] = True
+    if not res.get("partial"):
+        res["ok"] = True
+        res["error"] = ""
     return res
 
 
@@ -687,7 +735,98 @@ async def _test_config_doc(doc, probe_url):
         proc = await asyncio.create_subprocess_exec(
             *cmd, cfg_path, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT)
-        return await _wait_and_probe(proc, sport, probe_url, res)
+        ep_host = (res.get("endpoint") or "").rsplit(":", 1)[0]
+        reach_task = asyncio.create_task(iran_reach(ep_host))
+        out = await _wait_and_probe(proc, sport, probe_url, res)
+        out["iran_reach"], out["iran_ping_ms"] = await reach_task
+        return out
+    finally:
+        if proc and proc.returncode is None:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+        try:
+            os.unlink(cfg_path)
+        except Exception:
+            pass
+
+
+def parse_wg_conf(text: str):
+    """Parse a WireGuard .conf (INI). Returns (interface, peer) dicts or
+    None when the text is not a WireGuard config."""
+    if "[interface]" not in text.lower() or "privatekey" not in text.lower():
+        return None
+    iface, peer, cur = {}, {}, None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        low = line.lower()
+        if low == "[interface]":
+            cur = iface
+        elif low == "[peer]":
+            cur = peer
+        elif "=" in line and cur is not None:
+            k, v = line.split("=", 1)
+            cur[k.strip().lower()] = v.strip()
+    if not iface.get("privatekey") or not peer.get("publickey") \
+            or not peer.get("endpoint"):
+        return None
+    return iface, peer
+
+
+async def test_wireguard(data: bytes, probe_url: str = DEFAULT_PROBE) -> dict:
+    """Full tunnel test of a WireGuard .conf through sing-box (wireguard
+    endpoint, sing-box >= 1.11). Same multi-layer stack as links."""
+    res = _blank_res("wireguard")
+    try:
+        text = data.decode("utf-8", "replace")
+    except Exception:
+        res["error"] = "parse_failed"
+        return res
+    parsed = parse_wg_conf(text)
+    if not parsed:
+        res["error"] = "parse_failed"
+        return res
+    iface, peer = parsed
+    ep = peer["endpoint"].rsplit(":", 1)
+    if len(ep) != 2:
+        res["error"] = "parse_failed"
+        return res
+    host, port = ep[0].strip("[]"), int(ep[1])
+    res["endpoint"] = f"{host}:{port}"
+    res["iran_dns"] = await iran_dns_check(host)
+    addrs = [a.strip() for a in (iface.get("address") or "10.0.0.2/32").split(",")]
+    peer_cfg = {"address": host, "port": port,
+                "public_key": peer["publickey"],
+                "allowed_ips": [a.strip() for a in
+                                (peer.get("allowedips") or "0.0.0.0/0").split(",")]}
+    if peer.get("presharedkey"):
+        peer_cfg["pre_shared_key"] = peer["presharedkey"]
+    sport = _free_port()
+    cfg = {"log": {"level": "error"},
+           "inbounds": [{"type": "mixed", "listen": "127.0.0.1",
+                         "listen_port": sport}],
+           "endpoints": [{"type": "wireguard", "tag": "proxy",
+                          "address": addrs,
+                          "private_key": iface["privatekey"],
+                          "peers": [peer_cfg]}],
+           "outbounds": [{"type": "direct", "tag": "direct"}],
+           "route": {"final": "proxy"}}
+    cfg_path = f"/tmp/cfgtest-{sport}.json"
+    with open(cfg_path, "w") as f:
+        json.dump(cfg, f)
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            SINGBOX, "run", "-c", cfg_path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        reach_task = asyncio.create_task(iran_reach(host))
+        out = await _wait_and_probe(proc, sport, probe_url, res)
+        out["iran_reach"], out["iran_ping_ms"] = await reach_task
+        return out
     finally:
         if proc and proc.returncode is None:
             try:
@@ -719,8 +858,8 @@ async def test_npv(data: bytes, probe_url: str = DEFAULT_PROBE) -> dict:
             res["error"] = "npv_parse"
             return res
     total = len(docs)
-    tested = ok_count = 0
-    best = None
+    tested = ok_count = partial_count = 0
+    best = best_partial = None
     last_err = ""
     for doc in docs[:6]:
         r = await _test_config_doc(doc, probe_url)
@@ -732,16 +871,27 @@ async def test_npv(data: bytes, probe_url: str = DEFAULT_PROBE) -> dict:
                 best = r
             if ok_count >= 3:
                 break
+        elif r.get("partial"):
+            partial_count += 1
+            if best_partial is None:
+                best_partial = r
     res["servers_total"] = total
     res["servers_tested"] = tested
     res["servers_ok"] = ok_count
-    if best is not None:
+    res["servers_partial"] = partial_count
+    chosen = best if best is not None else best_partial
+    if chosen is not None:
         for k in ("endpoint", "ping_ms", "tunnel_ms", "exit_ip", "exit_country",
                   "exit_country_code", "exit_isp", "iran_dns", "dl_ms",
-                  "speed_kbps", "https_ok"):
-            res[k] = best.get(k)
-        res["ok"] = True
-        res["error"] = ""
+                  "speed_kbps", "https_ok", "probes_ok", "probes_total",
+                  "iran_reach", "iran_ping_ms"):
+            res[k] = chosen.get(k)
+        if best is not None:
+            res["ok"] = True
+            res["error"] = ""
+        else:
+            res["partial"] = True
+            res["error"] = "verdict_unknown"
         return res
     res["error"] = last_err or "tunnel_http_timeout"
     return res
@@ -822,6 +972,12 @@ async def test_file(data: bytes, filename: str, probe_url: str = DEFAULT_PROBE) 
         return await test_npv(data, probe_url)
     if ext == ".ovpn":
         return await test_ovpn(data, probe_url)
+    if ext in (".conf", ".txt"):
+        head = data[:4096].decode("utf-8", "replace")
+        if parse_wg_conf(head):
+            return await test_wireguard(data, probe_url)
+        if ext == ".conf" and "remote " in head and "client" in head:
+            return await test_ovpn(data, probe_url)  # ovpn saved as .conf
     return _blank_res("file")
 
 
@@ -867,7 +1023,9 @@ def format_result(res: dict) -> str:
         loc = f"{flag(res.get('exit_country_code', ''))} {res.get('exit_country', '')}".strip()
         dns = {"ok": "سالم ✅️", "poisoned": "مسموم/فیلتر ❌️", "timeout": "بدون پاسخ ⚠️",
                "ip": "—", "unknown": "نامشخص"}.get(res.get("iran_dns"), "نامشخص")
-        lines = ["✅️ وصل شد (تأیید دوبار + رد شدن دیتا)", f"📶 پینگ: {ping_s}"]
+        lines = ["✅️ وصل شد",
+                 f"🔗 تست اتصال: {res.get('probes_ok', 4)}/{res.get('probes_total', 4)} دامنه ✅️",
+                 f"📶 پینگ: {ping_s}"]
         if res.get("speed_kbps"):
             lines.append(f"🚀 سرعت تقریبی: {res['speed_kbps']} KB/s")
         if loc:
@@ -879,11 +1037,42 @@ def format_result(res: dict) -> str:
         if res.get("servers_total", 0) > 1:
             lines.append(f"🗂 سرورهای فایل: {res.get('servers_ok', 0)} از "
                          f"{res['servers_total']} سالم")
+        if res.get("iran_reach") is True:
+            ip_ms = res.get("iran_ping_ms")
+            lines.append("🇮🇷 دسترسی از ایران: در دسترس ✅️" +
+                         (f" (پینگ {round(ip_ms)}ms)" if ip_ms else ""))
+        elif res.get("iran_reach") is False:
+            lines.append("🇮🇷 دسترسی از ایران: در دسترس نیست ⚠️")
         if res.get("iran_dns") in ("ok", "poisoned", "timeout"):
             lines.append(f"🧪 DNS ایران: {dns}")
         lines.append("📍 تست از: سرور آلمان")
         return "\n".join(lines)
     return f"❌️ وصل نشد\n📝 دلیل: {user_reason(res)}"
+
+
+def format_partial(res: dict) -> str:
+    """The «نامعلوم» block (Iliya's three-state verdict): some probe
+    domains answered, some didn't. Neutral status — NOT an error text:
+    no ❌️, no reason line."""
+    ping = res.get("ping_ms")
+    ping_s = f"{ping}ms" if ping is not None else "—"
+    loc = f"{flag(res.get('exit_country_code', ''))} {res.get('exit_country', '')}".strip()
+    lines = [f"⚠️ وضعیت اتصال: نامعلوم ({res.get('probes_ok', '؟')} از "
+             f"{res.get('probes_total', 4)} دامنه جواب دادن)",
+             f"📶 پینگ: {ping_s}"]
+    if res.get("servers_total", 0) > 1:
+        lines.append(f"🗂 سرورهای فایل: {res.get('servers_ok', 0)} سالم، "
+                     f"{res.get('servers_partial', 0)} نامعلوم از {res['servers_total']}")
+    if loc:
+        lines.append(f"🌍 خروجی: {loc}")
+    if res.get("exit_ip"):
+        lines.append(f"🔢 آی‌پی خروجی: {res['exit_ip']}")
+    if res.get("iran_reach") is True:
+        lines.append("🇮🇷 دسترسی از ایران: در دسترس ✅️")
+    elif res.get("iran_reach") is False:
+        lines.append("🇮🇷 دسترسی از ایران: در دسترس نیست ⚠️")
+    lines.append("📍 تست از: سرور آلمان")
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

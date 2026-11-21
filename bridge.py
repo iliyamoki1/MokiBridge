@@ -52,7 +52,7 @@ LINK_RE = re.compile(
 FILE_EXTS = {".npv", ".npvt", ".npvs", ".hc", ".zip", ".ovpn", ".conf",
              ".json", ".txt", ".rar", ".7z", ".yaml", ".yml", ".gz"}
 TEXT_FILE_EXTS = {".txt", ".json", ".conf"}
-TESTABLE_EXTS = {".npv", ".npvt", ".npvs", ".ovpn"}
+TESTABLE_EXTS = {".npv", ".npvt", ".npvs", ".ovpn", ".conf"}
 WINDOW_SECONDS = {"now": 600, "1h": 3600, "24h": 86400, "all": None}
 
 db = sqlite3.connect(DB_PATH)
@@ -67,6 +67,9 @@ CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, kind TEXT, detail TEXT);
+CREATE TABLE IF NOT EXISTS sources (
+    username TEXT PRIMARY KEY, title TEXT, members INTEGER,
+    origin TEXT, joined_at INTEGER);
 """)
 db.commit()
 
@@ -175,14 +178,57 @@ def _u16len(s: str) -> int:
     return len(s.encode("utf-16-le")) // 2
 
 
-def build_post(link: str, title: str, stamp: str, result_text: str):
+CLIENT_BY_PROTO = {"vless": "v2rayNG", "vmess": "v2rayNG", "trojan": "v2rayNG",
+                   "ss": "v2rayNG", "ssr": "v2rayNG", "hysteria2": "Hiddify",
+                   "hy2": "Hiddify", "tuic": "Hiddify", "wireguard": "WireGuard"}
+CLIENT_BY_EXT = {".npv": "NapsternetV", ".npvt": "NapsternetV",
+                 ".npvs": "NpvTunnel", ".ovpn": "OpenVPN",
+                 ".hc": "HTTP Custom", ".ehi": "HTTP Injector",
+                 ".conf": "WireGuard"}
+
+
+def client_line(name):
+    return f"\n📱 کلاینت این کانفیگ: {name} — فایلش تو پین‌های کاناله" if name else ""
+
+
+def build_post(link: str, title: str, stamp: str, result_text: str,
+               client=None, src=None):
     head = f"📡 {title} · {stamp}\n\n"
-    text = head + link + "\n\n" + result_text
+    text = head + link + "\n\n" + result_text + client_line(client)
+    if src:
+        text += f"\n📥 منبع: @{src}"
     off = _u16len(head)
     ln = _u16len(link)
     entities = [{"type": "code", "offset": off, "length": ln},
                 {"type": "spoiler", "offset": off, "length": ln}]
     return text, entities
+
+
+STOCKPILE = os.path.join(BASE, "stockpile.jsonl")
+STOCKPILE_FILES = os.path.join(BASE, "stockpile_files")
+
+
+def stockpile_add(entry):
+    """Every successfully posted config is ALSO saved to a local
+    stockpile. An in-Iran poster instance (poster/poster.py) syncs this
+    file and keeps dripping the stockpile into the channel during a
+    national-internet cut, when this Germany server cannot reach Bale
+    at all. Nothing is ever lost: the outbox already retries forever,
+    and the stockpile survives independently of it."""
+    try:
+        os.makedirs(STOCKPILE_FILES, exist_ok=True)
+        key = entry.get("text") or entry.get("caption") or entry.get("file", "")
+        entry["h"] = hashlib.sha256(key.encode()).hexdigest()[:16]
+        entry["ts"] = int(time.time())
+        with open(STOCKPILE, "a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        with open(STOCKPILE) as f:
+            lines = f.readlines()
+        if len(lines) > 400:
+            with open(STOCKPILE, "w") as f:
+                f.writelines(lines[-400:])
+    except Exception:
+        pass
 
 
 async def bale_post(client: httpx.AsyncClient, text: str, entities=None):
@@ -192,12 +238,14 @@ async def bale_post(client: httpx.AsyncClient, text: str, entities=None):
     r = await client.post(f"{BALE_API}/sendMessage", json=payload)
     data = r.json()
     if data.get("ok"):
+        stockpile_add({"type": "text", "text": text, "entities": entities})
         return True
     if entities:  # degrade to clean plain text, never raw markup
         r = await client.post(f"{BALE_API}/sendMessage", json={
             "chat_id": CFG["bale_chat_id"], "text": text})
         data = r.json()
         if data.get("ok"):
+            stockpile_add({"type": "text", "text": text})
             return True
     if data.get("error_code") == 429:
         ra = (data.get("parameters") or {}).get("retry_after", 5)
@@ -215,6 +263,10 @@ _test_sem = asyncio.Semaphore(3)
 
 
 async def process_link_item(client: httpx.AsyncClient, payload_json: str):
+    """AIRTIGHT POSTING LAW (Iliya's absolute order): the channel NEVER
+    shows an error — no ❌️, no reason, no failure text, ever. A link is
+    posted ONLY when its test passed; failures are dropped silently and
+    exist only in the owner logs."""
     d = json.loads(payload_json)
     link, title, stamp = d["link"], d["title"], d["stamp"]
     probe = setting("probe_url", tester.DEFAULT_PROBE)
@@ -223,13 +275,22 @@ async def process_link_item(client: httpx.AsyncClient, payload_json: str):
             res = await tester.test_link(link, probe_url=probe)
         except Exception as e:
             res = {"ok": False, "error": f"tester_crash: {e}"[:60]}
-    if setting("send_mode", "all") == "passed_only" and not res.get("ok"):
-        log_event("skip_failed", link[:80])
-        return
-    text, entities = build_post(link, title, stamp, tester.format_result(res))
-    await bale_post(client, text, entities)
-    log_event("post_ok" if res.get("ok") else "post_fail",
-              f"{title}: {link[:60]}")
+    proto = link.split("://")[0].lower()
+    client_name = CLIENT_BY_PROTO.get(proto)
+    if res.get("ok"):
+        text, entities = build_post(link, title, stamp,
+                                    tester.format_result(res), client_name,
+                                    d.get("src"))
+        await bale_post(client, text, entities)
+        log_event("post_ok", f"{title}: {link[:60]}")
+    elif res.get("partial") and setting("send_mode", "all") != "passed_only":
+        text, entities = build_post(link, title, stamp,
+                                    tester.format_partial(res), client_name,
+                                    d.get("src"))
+        await bale_post(client, text, entities)
+        log_event("post_partial", f"{title}: {link[:60]}")
+    else:
+        log_event("drop_failed_link", f"{res.get('error', '')[:40]} {link[:60]}")
 
 
 async def process_file_item(client: httpx.AsyncClient, fpath, fname, caption):
@@ -248,14 +309,18 @@ async def process_file_item(client: httpx.AsyncClient, fpath, fname, caption):
                     res = await tester.test_file(data, fname, probe_url=probe)
         except Exception as e:
             res = {"ok": False, "error": f"tester_crash: {e}"[:60]}
-    if res is not None:
-        if res.get("error") == "ovpn_no_tun":
-            result_text = "\n\n📁 فایل کانفیگ (بدون تست — محدودیت سرور تست)"
-        else:
-            result_text = "\n\n" + tester.format_result(res)
-        if setting("send_mode", "all") == "passed_only" and not res.get("ok"):
-            log_event("skip_failed_file", fname)
-            return
+    if res is not None and res.get("ok"):
+        result_text = "\n\n" + tester.format_result(res)
+    elif res is not None and res.get("partial") and \
+            setting("send_mode", "all") != "passed_only":
+        result_text = "\n\n" + tester.format_partial(res)
+    elif res is not None and setting("send_mode", "all") == "passed_only":
+        # failed/untestable file + strict mode: dropped, owner log only
+        log_event("drop_failed_file", f"{res.get('error', '')[:40]} {fname}")
+        return
+    # failed or untestable file in normal mode: forwarded PLAINLY —
+    # caption only, no verdict, no error text (airtight law)
+    result_text += client_line(CLIENT_BY_EXT.get(ext))
     with open(fpath, "rb") as fh:
         r = await client.post(f"{BALE_API}/sendDocument", data={
             "chat_id": str(CFG["bale_chat_id"]),
@@ -267,6 +332,16 @@ async def process_file_item(client: httpx.AsyncClient, fpath, fname, caption):
             ra = (data.get("parameters") or {}).get("retry_after", 5)
             raise _RetryAfter(ra, str(data)[:160])
         raise RuntimeError(str(data)[:200])
+    try:
+        fh = hashlib.sha256(open(fpath, "rb").read()).hexdigest()[:16]
+        dst = os.path.join(STOCKPILE_FILES, fh + "_" + os.path.basename(fname))
+        if not os.path.exists(dst):
+            import shutil
+            shutil.copyfile(fpath, dst)
+        stockpile_add({"type": "file", "file": os.path.basename(dst),
+                       "caption": (caption or "") + result_text})
+    except Exception:
+        pass
     log_event("post_file", fname)
 
 
@@ -348,6 +423,7 @@ async def handle_message(msg, chat):
     if not within_window(msg.date.timestamp()):
         return
     title = getattr(chat, "title", "?") or "?"
+    uname = getattr(chat, "username", None)
     stamp = msg.date.strftime("%H:%M")
     links = extract_links(msg.message or "")
     if msg.photo:
@@ -356,7 +432,8 @@ async def handle_message(msg, chat):
         if already_seen(content_hash(link)):
             continue
         enqueue("link", text=json.dumps(
-            {"link": link, "title": title, "stamp": stamp}, ensure_ascii=False))
+            {"link": link, "title": title, "stamp": stamp, "src": uname},
+            ensure_ascii=False))
     if msg.document and setting("files_enabled", True):
         name = None
         for a in msg.document.attributes:
@@ -377,10 +454,13 @@ async def handle_message(msg, chat):
                     if already_seen(content_hash(link)):
                         continue
                     enqueue("link", text=json.dumps(
-                        {"link": link, "title": title, "stamp": stamp},
-                        ensure_ascii=False))
+                        {"link": link, "title": title, "stamp": stamp,
+                         "src": uname}, ensure_ascii=False))
+            cap = f"📁 فایل کانفیگ\n📡 {title} · {stamp}"
+            if uname:
+                cap += f"\n📥 منبع: @{uname}"
             enqueue("file", file_path=path, file_name=name or f"file{ext or '.bin'}",
-                    caption=f"📁 فایل کانفیگ\n📡 {title} · {stamp}")
+                    caption=cap)
 
 
 def make_client():
@@ -404,6 +484,7 @@ async def backfill(client):
         chat = d.entity
         if not (getattr(chat, "broadcast", False) or getattr(chat, "megagroup", False)):
             continue
+        record_source(chat, "membership")
         key = f"backfill:{chat.id}"
         if meta_get(key):
             continue
@@ -419,6 +500,63 @@ async def backfill(client):
         except Exception as e:
             print(f"[bf] channel error {getattr(chat, 'title', '?')}: {e}", flush=True)
         await asyncio.sleep(3)
+
+
+def record_source(entity, origin):
+    """Store a source channel's identity (username/title/members) so the
+    owner panels can list exactly what the bridge harvests from."""
+    uname = getattr(entity, "username", None)
+    if not uname:
+        return
+    try:
+        db.execute(
+            "INSERT INTO sources (username,title,members,origin,joined_at) "
+            "VALUES (?,?,?,?,?) ON CONFLICT(username) DO UPDATE SET "
+            "title=excluded.title, members=excluded.members",
+            (uname.lower(), getattr(entity, "title", "") or "",
+             getattr(entity, "participants_count", None), origin,
+             int(time.time())))
+        db.commit()
+    except Exception:
+        pass
+
+
+async def do_join_list(client, names):
+    """Join an owner-supplied list of channels (from the control bots)
+    and record each channel's full info in the sources table."""
+    from telethon.tl.functions.channels import JoinChannelRequest
+    from telethon.errors import FloodWaitError
+    have = set()
+    async for d in client.iter_dialogs():
+        un = getattr(d.entity, "username", None)
+        if un:
+            have.add(un.lower())
+            record_source(d.entity, "membership")
+    joined = already = failed = 0
+    for raw in names:
+        uname = str(raw).strip().lstrip("@").split("/")[-1].lower()
+        if not uname:
+            continue
+        if uname in have:
+            already += 1
+            continue
+        try:
+            await client(JoinChannelRequest(uname))
+            ent = await client.get_entity(uname)
+            record_source(ent, "list")
+            joined += 1
+            log_event("joined", f"@{uname} — {getattr(ent, 'title', '')}")
+        except FloodWaitError as e:
+            log_event("join_floodwait", f"{e.seconds}s")
+            break
+        except Exception as e:
+            failed += 1
+            log_event("join_failed", f"{uname}: {str(e)[:60]}")
+        await asyncio.sleep(random.uniform(15, 30))
+    log_event("join_list_summary",
+              f"joined={joined} already={already} failed={failed}")
+    if joined:
+        write_state(want_backfill=True)
 
 
 async def do_join_best(client):
@@ -442,6 +580,10 @@ async def do_join_best(client):
         try:
             await client(JoinChannelRequest(uname))
             joined += 1
+            try:
+                record_source(await client.get_entity(uname), "best")
+            except Exception:
+                pass
             log_event("joined", uname)
         except FloodWaitError as e:
             log_event("join_floodwait", f"{e.seconds}s")
@@ -459,6 +601,10 @@ async def flags_task(client):
     while True:
         try:
             st = read_state()
+            if st.get("want_join_list"):
+                names = st.get("want_join_list") or []
+                write_state(want_join_list=[])
+                await do_join_list(client, names)
             if st.get("want_join"):
                 write_state(want_join=False)
                 await do_join_best(client)
