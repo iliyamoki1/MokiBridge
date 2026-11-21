@@ -1,0 +1,8 @@
+*.env
+config.json
+state.json
+*.session
+session.txt
+bridge.db
+files/
+__pycache__/

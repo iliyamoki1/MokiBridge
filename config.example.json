@@ -1,0 +1,6 @@
+{
+  "bale_chat_id": 0,
+  "tg_api_id": 0,
+  "tg_api_hash": "YOUR_TELEGRAM_API_HASH",
+  "backfill_msgs": 200
+}
