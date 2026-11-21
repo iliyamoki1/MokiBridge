@@ -89,6 +89,8 @@ ABOUT = (HEADER + "<b>درباره</b>\n"
 def main_kb():
     st = read_state()
     mode = "فقط تست‌شده‌ها ✅️" if st.get("send_mode") == "passed_only" else "فایل‌ها حتی بدون تست 📁"
+    dest = {"bale": "بله", "rubika": "روبیکا", "both": "بله + روبیکا"}.get(
+        st.get("dest", "bale"), "بله")
     win = WINDOWS.get(st.get("time_window", "now"), "از الان")
     files = "روشن ✅️" if st.get("files_enabled", True) else "خاموش ❌️"
     def sep(label):
@@ -104,6 +106,7 @@ def main_kb():
         [InlineKeyboardButton(text="📚 منابع ثبت‌شده", callback_data="sources"),
          InlineKeyboardButton(text="🔎 اسکن سابقه کانال‌ها", callback_data="backfill")],
         sep("── ⚙️ تنظیمات ──"),
+        [InlineKeyboardButton(text=f"📤 مقصد ارسال: {dest}", callback_data="dest")],
         [InlineKeyboardButton(text=f"🎯 حالت ارسال: {mode}", callback_data="mode")],
         [InlineKeyboardButton(text=f"🕐 بازه زمانی: {win}", callback_data="winmenu"),
          InlineKeyboardButton(text=f"📁 فایل‌ها: {files}", callback_data="files")],
@@ -449,6 +452,18 @@ async def cb_joinbest(c: CallbackQuery):
 @router.callback_query(F.data == "noop")
 async def cb_noop(c: CallbackQuery):
     await c.answer()
+
+
+@router.callback_query(F.data == "dest")
+async def cb_dest(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    cur = read_state().get("dest", "bale")
+    nxt = {"bale": "rubika", "rubika": "both", "both": "bale"}[cur]
+    write_state(dest=nxt)
+    await c.message.edit_reply_markup(reply_markup=main_kb())
+    label = {"bale": "بله", "rubika": "روبیکا", "both": "بله + روبیکا"}[nxt]
+    await c.answer(f"📤 مقصد ارسال: {label}")
 
 
 # ---------------- join-by-list + sources (owner) ----------------

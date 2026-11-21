@@ -204,6 +204,76 @@ def build_post(link: str, title: str, stamp: str, result_text: str,
     return text, entities
 
 
+# ---------------- Rubika destination (Iliya's pivot 2026-11-22) -------
+# Rubika has an official Bot API (botapi.rubika.ir/v3/<token>/<method>),
+# Telegram-shaped: sendMessage / sendFile / getMe / getUpdates. The
+# bridge's destination is switchable via state.json "dest":
+# bale | rubika | both. Rubika config lives in rubika.env (optional —
+# absent file = Rubika disabled).
+RUBIKA_ENV = os.path.join(BASE, "rubika.env")
+RUBIKA = {}
+if os.path.exists(RUBIKA_ENV):
+    for _line in open(RUBIKA_ENV):
+        _line = _line.strip()
+        if "=" in _line and not _line.startswith("#"):
+            _k, _v = _line.split("=", 1)
+            RUBIKA[_k.strip()] = _v.strip()
+RUBIKA_API = ("https://botapi.rubika.ir/v3/" + RUBIKA.get("RUBIKA_TOKEN", "")
+              if RUBIKA.get("RUBIKA_TOKEN") else "")
+
+
+async def rubika_post(client: httpx.AsyncClient, text: str):
+    chat = RUBIKA.get("RUBIKA_CHAT_ID")
+    if not RUBIKA_API or not chat:
+        raise RuntimeError("rubika not configured")
+    r = await client.post(f"{RUBIKA_API}/sendMessage",
+                          json={"chat_id": chat, "text": text})
+    d = r.json()
+    if d.get("status") != "OK":
+        raise RuntimeError(f"rubika sendMessage: {str(d)[:140]}")
+    stockpile_add({"type": "text", "text": text})
+    return True
+
+
+async def rubika_send_file(client: httpx.AsyncClient, fpath, caption):
+    chat = RUBIKA.get("RUBIKA_CHAT_ID")
+    if not RUBIKA_API or not chat:
+        raise RuntimeError("rubika not configured")
+    with open(fpath, "rb") as fh:
+        r = await client.post(
+            f"{RUBIKA_API}/sendFile",
+            data={"chat_id": chat, "text": caption or ""},
+            files={"file": (os.path.basename(fpath), fh)})
+    d = r.json()
+    if d.get("status") != "OK":
+        raise RuntimeError(f"rubika sendFile: {str(d)[:140]}")
+    return True
+
+
+async def deliver_text(client, text, entities=None):
+    """Post a text to the configured destination(s). Bale failures raise
+    (the outbox retries, as always); in rubika-only mode a Rubika failure
+    raises instead; in 'both' mode Rubika is a best-effort mirror."""
+    dest = setting("dest", "bale")
+    if dest in ("bale", "both"):
+        await deliver_text(client, text, entities)
+    if dest in ("rubika", "both"):
+        if dest == "rubika":
+            await rubika_post(client, text)
+        else:
+            try:
+                await rubika_post(client, text)
+            except Exception as e:
+                log_event("rubika_mirror_error", str(e)[:100])
+
+
+async def deliver_file(client, fpath, fname, caption):
+    """File counterpart of deliver_text (Bale sendDocument is done by the
+    caller for its stockpile bookkeeping; this helper is used when the
+    destination is Rubika-only)."""
+    await rubika_send_file(client, fpath, caption)
+
+
 STOCKPILE = os.path.join(BASE, "stockpile.jsonl")
 STOCKPILE_FILES = os.path.join(BASE, "stockpile_files")
 
@@ -281,13 +351,13 @@ async def process_link_item(client: httpx.AsyncClient, payload_json: str):
         text, entities = build_post(link, title, stamp,
                                     tester.format_result(res), client_name,
                                     d.get("src"))
-        await bale_post(client, text, entities)
+        await deliver_text(client, text, entities)
         log_event("post_ok", f"{title}: {link[:60]}")
     elif res.get("partial") and setting("send_mode", "all") != "passed_only":
         text, entities = build_post(link, title, stamp,
                                     tester.format_partial(res), client_name,
                                     d.get("src"))
-        await bale_post(client, text, entities)
+        await deliver_text(client, text, entities)
         log_event("post_partial", f"{title}: {link[:60]}")
     else:
         log_event("drop_failed_link", f"{res.get('error', '')[:40]} {link[:60]}")
@@ -321,11 +391,21 @@ async def process_file_item(client: httpx.AsyncClient, fpath, fname, caption):
     # failed or untestable file in normal mode: forwarded PLAINLY —
     # caption only, no verdict, no error text (airtight law)
     result_text += client_line(CLIENT_BY_EXT.get(ext))
+    dest = setting("dest", "bale")
+    if dest == "rubika":
+        await rubika_send_file(client, fpath, (caption or "") + result_text)
+        log_event("post_file", fname + " (rubika)")
+        return
     with open(fpath, "rb") as fh:
         r = await client.post(f"{BALE_API}/sendDocument", data={
             "chat_id": str(CFG["bale_chat_id"]),
             "caption": (caption or "") + result_text},
             files={"document": (fname, fh)})
+    if dest == "both":
+        try:
+            await rubika_send_file(client, fpath, (caption or "") + result_text)
+        except Exception as e:
+            log_event("rubika_mirror_error", str(e)[:100])
     data = r.json()
     if not data.get("ok"):
         if data.get("error_code") == 429:
