@@ -18,7 +18,10 @@ import struct
 import subprocess
 import sys
 import time
+import re
 import urllib.parse
+
+import httpx
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 SINGBOX = os.path.join(BASE, "bin", "sing-box")
@@ -304,6 +307,7 @@ def _dns_a(host: str, resolver: str, timeout=3.0):
 
 
 def iran_dns_status(host: str) -> str:
+    """Legacy sync check (kept for compat; iran_dns_check is primary)."""
     try:
         socket.inet_aton(host)
         return "ip"
@@ -320,6 +324,59 @@ def iran_dns_status(host: str) -> str:
     if iran:
         return "ok"
     return "unknown"
+
+
+_gp_cache = {}
+
+
+async def iran_dns_check(host: str) -> str:
+    """REAL in-Iran DNS check via a Globalping probe in Tehran — Iranian
+    resolvers refuse foreign clients, so asking them from Germany timed
+    out for most domains. Cached 10 min per host.
+    Returns ok / poisoned / timeout / ip / unknown."""
+    try:
+        socket.inet_aton(host)
+        return "ip"
+    except Exception:
+        pass
+    now = time.time()
+    hit = _gp_cache.get(host)
+    if hit and now - hit[1] < 600:
+        return hit[0]
+    verdict = "unknown"
+    try:
+        async with httpx.AsyncClient(timeout=20) as cl:
+            r = await cl.post("https://api.globalping.io/v1/measurements", json={
+                "type": "dns", "target": host,
+                "locations": [{"country": "IR"}], "limit": 1})
+            if r.status_code in (200, 202):
+                mid = r.json().get("id")
+                raw = ""
+                for _ in range(8):
+                    await asyncio.sleep(1.6)
+                    g = await cl.get(
+                        f"https://api.globalping.io/v1/measurements/{mid}")
+                    d = g.json()
+                    if d.get("status") == "finished":
+                        res0 = (d.get("results") or [{}])[0]
+                        raw = (res0.get("result") or {}).get("rawOutput", "")
+                        break
+                if raw:
+                    ips = re.findall(r"\bIN\s+A\s+(\d+\.\d+\.\d+\.\d+)", raw)
+                    glob = await asyncio.get_running_loop().run_in_executor(
+                        None, _dns_a, host, GLOBAL_RESOLVER)
+                    if any(ip in POISON_IPS or ip.startswith("10.") for ip in ips):
+                        verdict = "poisoned"
+                    elif not ips and glob:
+                        verdict = "poisoned"  # resolves globally, dead in Iran
+                    elif ips:
+                        verdict = "ok"
+                    else:
+                        verdict = "timeout"
+    except Exception:
+        verdict = "unknown"
+    _gp_cache[host] = (verdict, now)
+    return verdict
 
 
 def _tcp_ping(host: str, port: int, timeout=4.0):
@@ -369,7 +426,7 @@ async def test_link(link: str, timeout: int = 22, probe_url: str = DEFAULT_PROBE
     host, port, proto = sp["host"], sp["port"], sp["proto"]
     res["endpoint"] = f"{host}:{port}"
     loop = asyncio.get_running_loop()
-    res["iran_dns"] = await loop.run_in_executor(None, iran_dns_status, host)
+    res["iran_dns"] = await iran_dns_check(host)
     if proto not in ("hysteria2", "tuic"):
         res["ping_ms"] = await loop.run_in_executor(None, _tcp_ping, host, port)
     sport = _free_port()
@@ -445,6 +502,38 @@ async def _wait_and_probe(proc, sport, probe_url, res):
         res["error"] = f"tunnel_http_{code or 'timeout'}"
         return res
     res["tunnel_ms"] = ms
+    # STRICT VERIFICATION (Iliya's order: tests must be precise — one lucky
+    # probe is not "connected"). A config only passes if, through the same
+    # tunnel, a SECOND probe also succeeds AND real data actually flows
+    # (a 25 KB download), not just a handshake.
+    body2, code2, _ms2 = await loop.run_in_executor(
+        None, _curl_socks, sport, probe_url, 10)
+    if code2 not in (200, 204):
+        res["error"] = "tunnel_unstable"
+        return res
+    dl, code3, dl_ms = await loop.run_in_executor(
+        None, _curl_socks, sport,
+        "http://speed.cloudflare.com/__down?bytes=25000", 12)
+    if code3 != 200 or not dl or len(dl) < 10000:
+        res["error"] = "tunnel_nodata"
+        return res
+    res["dl_ms"] = dl_ms
+    if dl_ms:
+        res["speed_kbps"] = round(len(dl) / max(dl_ms, 1) * 1000 / 1024, 1)
+    # Layer: HTTPS through the tunnel (some configs pass plain HTTP but
+    # break TLS). Two targets; the layer fails only if both fail.
+    https_ok = False
+    for url in ("https://www.google.com/generate_204",
+                "https://cp.cloudflare.com/generate_204"):
+        _b, code4, _m = await loop.run_in_executor(
+            None, _curl_socks, sport, url, 10)
+        if code4 in (200, 204):
+            https_ok = True
+            break
+    res["https_ok"] = https_ok
+    if not https_ok:
+        res["error"] = "tunnel_https_fail"
+        return res
     body, code, _ms = await loop.run_in_executor(
         None, _curl_socks, sport,
         "http://ip-api.com/json/?fields=query,country,countryCode,isp", 10)
@@ -468,16 +557,81 @@ def _blank_res(proto):
             "error": ""}
 
 
-async def test_npv(data: bytes, probe_url: str = DEFAULT_PROBE) -> dict:
-    """Test a NapsternetV (.npv/.npvt/.npvs) file: it carries a full
-    v2ray/sing-box config JSON — lift its proxy outbound and run the
-    same tunnel probes against it."""
-    res = _blank_res("npv")
+NPVT_DECODER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "tools", "npvt-decoder", "decode_json.php")
+
+
+async def _decrypt_npvt(data: bytes):
+    """NPVT1 = NapsternetV white-box AES-CTR export. Decoded with the
+    community PHP whitebox decoder; returns the Xray config dicts of
+    the servers inside the file."""
+    path = f"/tmp/npvt-{random.randint(10000, 99999)}.npvt"
+    with open(path, "wb") as f:
+        f.write(data)
     try:
-        doc = json.loads(data.decode("utf-8", "ignore"))
+        proc = await asyncio.create_subprocess_exec(
+            "php", NPVT_DECODER, path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=90)
+        doc = json.loads(out.decode(errors="ignore"))
+        configs = []
+        for srv in doc.get("servers", []):
+            vj = (srv.get("v2rayProfile") or {}).get("v2rayJson")
+            if vj:
+                try:
+                    configs.append(json.loads(vj))
+                except Exception:
+                    pass
+        return configs
     except Exception:
-        res["error"] = "npv_parse"
-        return res
+        return []
+    finally:
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
+
+
+def spec_from_xray_outbound(ob):
+    """Translate a v2ray/xray-format outbound into the tester's spec
+    dict, so plain (no-TLS) configs can be routed to sing-box — Xray 26
+    refuses vless/vmess/trojan without TLS to public servers, and most
+    NapsternetV exports are exactly that."""
+    proto = (ob.get("protocol") or "").lower()
+    if proto not in ("vless", "vmess", "trojan", "shadowsocks"):
+        return None
+    st = ob.get("settings") or {}
+    vn = (st.get("vnext") or [{}])[0]
+    sv = (st.get("servers") or [{}])[0]
+    user = (vn.get("users") or [{}])[0]
+    ss = ob.get("streamSettings") or {}
+    tls = ss.get("tlsSettings") or {}
+    real = ss.get("realitySettings") or {}
+    ws = ss.get("wsSettings") or {}
+    grpc = ss.get("grpcSettings") or {}
+    sp = {"proto": "ss" if proto == "shadowsocks" else proto,
+          "host": vn.get("address") or sv.get("address") or "",
+          "port": int(vn.get("port") or sv.get("port") or 0),
+          "uuid": user.get("id") or "", "password": sv.get("password") or user.get("pass") or "",
+          "method": sv.get("method") or "", "cipher": user.get("security") or "auto",
+          "alter_id": int(user.get("alterId") or 0), "flow": user.get("flow") or "",
+          "security": ss.get("security") or "none",
+          "sni": tls.get("serverName") or real.get("serverName") or "",
+          "fp": tls.get("fingerprint") or real.get("fingerprint") or "",
+          "pbk": real.get("publicKey") or "", "sid": real.get("shortId") or "",
+          "insecure": bool(tls.get("allowInsecure")),
+          "transport": ss.get("network") or "tcp",
+          "ws_path": ws.get("path") or "/",
+          "ws_host": (ws.get("headers") or {}).get("Host") or "",
+          "grpc_service": grpc.get("serviceName") or "",
+          "congestion": "bbr", "raw": ""}
+    return sp
+
+
+async def _test_config_doc(doc, probe_url):
+    """Run the full tunnel test stack against one parsed config doc
+    (a v2ray/xray or sing-box JSON with outbounds)."""
+    res = _blank_res("npv")
     outbounds = doc.get("outbounds") or []
     proxy = None
     for o in outbounds:
@@ -488,7 +642,6 @@ async def test_npv(data: bytes, probe_url: str = DEFAULT_PROBE) -> dict:
     if not proxy:
         res["error"] = "npv_parse"
         return res
-    # endpoint + ping, best effort from the outbound's settings
     try:
         st = proxy.get("settings") or {}
         vn = (st.get("vnext") or [{}])[0]
@@ -498,12 +651,22 @@ async def test_npv(data: bytes, probe_url: str = DEFAULT_PROBE) -> dict:
         if host and port:
             res["endpoint"] = f"{host}:{port}"
             loop = asyncio.get_running_loop()
-            res["iran_dns"] = await loop.run_in_executor(None, iran_dns_status, str(host))
-            res["ping_ms"] = await loop.run_in_executor(None, _tcp_ping, str(host), int(port))
+            res["iran_dns"] = await iran_dns_check(str(host))
+            res["ping_ms"] = await loop.run_in_executor(
+                None, _tcp_ping, str(host), int(port))
     except Exception:
         pass
     sport = _free_port()
-    if "protocol" in proxy:  # xray/v2ray shape
+    sp = spec_from_xray_outbound(proxy) if "protocol" in proxy else None
+    if sp and use_singbox(sp):
+        # plain no-TLS config: Xray would refuse it — sing-box takes it
+        cfg = {"log": {"level": "error"},
+               "inbounds": [{"type": "mixed", "listen": "127.0.0.1",
+                             "listen_port": sport}],
+               "outbounds": [dict(build_singbox_outbound(sp), tag="proxy")],
+               "route": {"final": "proxy"}}
+        cmd = [SINGBOX, "run", "-c"]
+    elif "protocol" in proxy:  # xray/v2ray shape
         cfg = {"log": {"loglevel": "error"},
                "inbounds": [{"listen": "127.0.0.1", "port": sport,
                              "protocol": "socks", "settings": {"udp": True}}],
@@ -538,6 +701,52 @@ async def test_npv(data: bytes, probe_url: str = DEFAULT_PROBE) -> dict:
             pass
 
 
+async def test_npv(data: bytes, probe_url: str = DEFAULT_PROBE) -> dict:
+    """Test a NapsternetV file. Plain .npv = config JSON; .npvt (NPVT1)
+    is the app's encrypted export — decrypted first. Multi-server files
+    are tested server by server (up to 6, stop at 3 healthy) and the
+    counts are reported."""
+    res = _blank_res("npv")
+    if data[:5] == b"NPVT1":
+        docs = await _decrypt_npvt(data)
+        if not docs:
+            res["error"] = "npv_parse"
+            return res
+    else:
+        try:
+            docs = [json.loads(data.decode("utf-8", "ignore"))]
+        except Exception:
+            res["error"] = "npv_parse"
+            return res
+    total = len(docs)
+    tested = ok_count = 0
+    best = None
+    last_err = ""
+    for doc in docs[:6]:
+        r = await _test_config_doc(doc, probe_url)
+        tested += 1
+        last_err = r.get("error", "")
+        if r.get("ok"):
+            ok_count += 1
+            if best is None:
+                best = r
+            if ok_count >= 3:
+                break
+    res["servers_total"] = total
+    res["servers_tested"] = tested
+    res["servers_ok"] = ok_count
+    if best is not None:
+        for k in ("endpoint", "ping_ms", "tunnel_ms", "exit_ip", "exit_country",
+                  "exit_country_code", "exit_isp", "iran_dns", "dl_ms",
+                  "speed_kbps", "https_ok"):
+            res[k] = best.get(k)
+        res["ok"] = True
+        res["error"] = ""
+        return res
+    res["error"] = last_err or "tunnel_http_timeout"
+    return res
+
+
 async def test_ovpn(data: bytes, probe_url: str = DEFAULT_PROBE) -> dict:
     """Test an OpenVPN (.ovpn) file with a real openvpn handshake.
     Success = 'Initialization Sequence Completed'. If the host lacks a
@@ -560,7 +769,7 @@ async def test_ovpn(data: bytes, probe_url: str = DEFAULT_PROBE) -> dict:
         return res
     res["endpoint"] = f"{host}:{port}"
     loop = asyncio.get_running_loop()
-    res["iran_dns"] = await loop.run_in_executor(None, iran_dns_status, host)
+    res["iran_dns"] = await iran_dns_check(host)
     if proto.startswith("tcp"):
         res["ping_ms"] = await loop.run_in_executor(None, _tcp_ping, host, port)
     path = f"/tmp/ovpn-{random.randint(1000, 9999)}.ovpn"
@@ -630,6 +839,12 @@ def user_reason(res: dict) -> str:
         return "لینک کانفیگ خوانا نیست"
     if raw.startswith("tunnel_http"):
         return "سرور جواب نداد (احتمالاً خاموش یا پر است)"
+    if raw == "tunnel_unstable":
+        return "اتصال ناپایدار بود (یه بار وصل شد، بار دوم نه)"
+    if raw == "tunnel_nodata":
+        return "وصل شد ولی دیتا رد نشد (عملاً کار نمی‌کنه)"
+    if raw == "tunnel_https_fail":
+        return "ترافیک امن (HTTPS) از تونل رد نشد"
     if raw.startswith("core_exit") or raw == "core_not_up":
         return "قالب این کانفیگ پشتیبانی نشد"
     if raw == "ovpn_auth":
@@ -652,12 +867,21 @@ def format_result(res: dict) -> str:
         loc = f"{flag(res.get('exit_country_code', ''))} {res.get('exit_country', '')}".strip()
         dns = {"ok": "سالم ✅️", "poisoned": "مسموم/فیلتر ❌️", "timeout": "بدون پاسخ ⚠️",
                "ip": "—", "unknown": "نامشخص"}.get(res.get("iran_dns"), "نامشخص")
-        lines = ["✅️ وصل شد", f"📶 پینگ: {ping_s}"]
+        lines = ["✅️ وصل شد (تأیید دوبار + رد شدن دیتا)", f"📶 پینگ: {ping_s}"]
+        if res.get("speed_kbps"):
+            lines.append(f"🚀 سرعت تقریبی: {res['speed_kbps']} KB/s")
         if loc:
             lines.append(f"🌍 خروجی: {loc}")
         if res.get("exit_ip"):
             lines.append(f"🔢 آی‌پی خروجی: {res['exit_ip']}")
-        lines.append(f"🧪 DNS ایران: {dns}")
+        if res.get("exit_isp"):
+            lines.append(f"🏢 اپراتور خروجی: {res['exit_isp']}")
+        if res.get("servers_total", 0) > 1:
+            lines.append(f"🗂 سرورهای فایل: {res.get('servers_ok', 0)} از "
+                         f"{res['servers_total']} سالم")
+        if res.get("iran_dns") in ("ok", "poisoned", "timeout"):
+            lines.append(f"🧪 DNS ایران: {dns}")
+        lines.append("📍 تست از: سرور آلمان")
         return "\n".join(lines)
     return f"❌️ وصل نشد\n📝 دلیل: {user_reason(res)}"
 
